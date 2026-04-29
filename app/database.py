@@ -32,6 +32,14 @@ class Brand:
 
 
 @dataclass(frozen=True)
+class Store:
+    slug: str
+    name: str
+    thread_id: int | None
+    seeded: bool
+
+
+@dataclass(frozen=True)
 class ParserStatus:
     source: str
     brand: str
@@ -55,7 +63,19 @@ class Database(Protocol):
 
     def active_brands(self) -> list[Brand]: ...
 
+    def upsert_store(self, slug: str, name: str) -> Store: ...
+
+    def set_store_thread(self, slug: str, thread_id: int) -> None: ...
+
+    def mark_store_seeded(self, slug: str) -> None: ...
+
+    def get_store(self, slug: str) -> Store | None: ...
+
+    def all_stores(self) -> list[Store]: ...
+
     def insert_listing_if_new(self, listing: Listing) -> bool: ...
+
+    def mark_existing_listings_sent_for_store(self, store_slug: str) -> int: ...
 
     def mark_sent(self, listing: Listing) -> None: ...
 
@@ -94,6 +114,14 @@ class SQLiteDatabase:
                     removed_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS stores (
+                    slug TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    thread_id INTEGER,
+                    seeded INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS listings (
                     id TEXT PRIMARY KEY,
                     source TEXT NOT NULL,
@@ -118,6 +146,14 @@ class SQLiteDatabase:
                 );
                 """
             )
+            cols = conn.execute("PRAGMA table_info(listings)").fetchall()
+            if not any(row["name"] == "store" for row in cols):
+                conn.execute("ALTER TABLE listings ADD COLUMN store TEXT")
+            store_cols = conn.execute("PRAGMA table_info(stores)").fetchall()
+            if not any(row["name"] == "seeded" for row in store_cols):
+                conn.execute(
+                    "ALTER TABLE stores ADD COLUMN seeded INTEGER NOT NULL DEFAULT 0"
+                )
 
     def seed_from_yaml(self, brands_file: Path) -> None:
         for name in load_brand_names(brands_file):
@@ -187,19 +223,74 @@ class SQLiteDatabase:
             ).fetchall()
         return [brand_from_row(row) for row in rows]
 
+    def upsert_store(self, slug: str, name: str) -> Store:
+        timestamp = now_iso()
+        with self._lock, self.connect() as conn:
+            existing = conn.execute(
+                "SELECT slug, name, thread_id, seeded FROM stores WHERE slug = ?",
+                (slug,),
+            ).fetchone()
+            if existing:
+                if existing["name"] != name:
+                    conn.execute(
+                        "UPDATE stores SET name = ? WHERE slug = ?",
+                        (name, slug),
+                    )
+                return Store(
+                    slug=slug,
+                    name=name,
+                    thread_id=existing["thread_id"],
+                    seeded=bool(existing["seeded"]),
+                )
+            conn.execute(
+                "INSERT INTO stores (slug, name, thread_id, seeded, created_at) VALUES (?, ?, NULL, 0, ?)",
+                (slug, name, timestamp),
+            )
+            return Store(slug=slug, name=name, thread_id=None, seeded=False)
+
+    def set_store_thread(self, slug: str, thread_id: int) -> None:
+        with self._lock, self.connect() as conn:
+            conn.execute(
+                "UPDATE stores SET thread_id = ? WHERE slug = ?",
+                (thread_id, slug),
+            )
+
+    def mark_store_seeded(self, slug: str) -> None:
+        with self._lock, self.connect() as conn:
+            conn.execute(
+                "UPDATE stores SET seeded = 1 WHERE slug = ?",
+                (slug,),
+            )
+
+    def get_store(self, slug: str) -> Store | None:
+        with self._lock, self.connect() as conn:
+            row = conn.execute(
+                "SELECT slug, name, thread_id, seeded FROM stores WHERE slug = ?",
+                (slug,),
+            ).fetchone()
+        return store_from_row(row) if row else None
+
+    def all_stores(self) -> list[Store]:
+        with self._lock, self.connect() as conn:
+            rows = conn.execute(
+                "SELECT slug, name, thread_id, seeded FROM stores ORDER BY name"
+            ).fetchall()
+        return [store_from_row(row) for row in rows]
+
     def insert_listing_if_new(self, listing: Listing) -> bool:
         with self._lock, self.connect() as conn:
             try:
                 conn.execute(
                     """
                     INSERT INTO listings
-                    (id, source, brand, title, price, url, image_url, sent, first_seen_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    (id, source, brand, store, title, price, url, image_url, sent, first_seen_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
                     """,
                     (
                         listing.id,
                         listing.source,
                         listing.brand,
+                        listing.store,
                         listing.title,
                         listing.price,
                         listing.url,
@@ -210,6 +301,14 @@ class SQLiteDatabase:
                 return True
             except sqlite3.IntegrityError:
                 return False
+
+    def mark_existing_listings_sent_for_store(self, store_slug: str) -> int:
+        with self._lock, self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE listings SET sent = 1, posted_at = ? WHERE store = ? AND sent = 0",
+                (now_iso(), store_slug),
+            )
+            return cur.rowcount
 
     def mark_sent(self, listing: Listing) -> None:
         with self._lock, self.connect() as conn:
@@ -222,10 +321,15 @@ class SQLiteDatabase:
         with self._lock, self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT l.source, l.brand, l.title, l.price, l.url, l.image_url
+                SELECT l.source, l.brand, l.store, l.title, l.price, l.url, l.image_url
                 FROM listings AS l
-                JOIN brands AS b ON b.name = l.brand
-                WHERE l.sent = 0 AND b.active = 1
+                LEFT JOIN brands AS b ON l.store IS NULL AND b.name = l.brand
+                LEFT JOIN stores AS s ON l.store IS NOT NULL AND s.slug = l.store
+                WHERE l.sent = 0
+                  AND (
+                    (l.store IS NULL AND b.active = 1)
+                    OR (l.store IS NOT NULL AND s.thread_id IS NOT NULL)
+                  )
                 ORDER BY l.first_seen_at ASC
                 LIMIT ?
                 """,
@@ -288,6 +392,20 @@ class PostgresDatabase:
             )
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS stores (
+                    slug TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    thread_id BIGINT,
+                    seeded BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                "ALTER TABLE stores ADD COLUMN IF NOT EXISTS seeded BOOLEAN NOT NULL DEFAULT FALSE"
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS listings (
                     id TEXT PRIMARY KEY,
                     source TEXT NOT NULL,
@@ -303,6 +421,7 @@ class PostgresDatabase:
                 )
                 """
             )
+            cur.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS store TEXT")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS parser_status (
@@ -387,19 +506,76 @@ class PostgresDatabase:
             rows = cur.fetchall()
         return [brand_from_row(row) for row in rows]
 
+    def upsert_store(self, slug: str, name: str) -> Store:
+        timestamp = now_iso()
+        with self._lock, self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT slug, name, thread_id, seeded FROM stores WHERE slug = %s",
+                (slug,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                if existing["name"] != name:
+                    cur.execute(
+                        "UPDATE stores SET name = %s WHERE slug = %s",
+                        (name, slug),
+                    )
+                return Store(
+                    slug=slug,
+                    name=name,
+                    thread_id=existing["thread_id"],
+                    seeded=bool(existing["seeded"]),
+                )
+            cur.execute(
+                "INSERT INTO stores (slug, name, thread_id, seeded, created_at) "
+                "VALUES (%s, %s, NULL, FALSE, %s)",
+                (slug, name, timestamp),
+            )
+            return Store(slug=slug, name=name, thread_id=None, seeded=False)
+
+    def set_store_thread(self, slug: str, thread_id: int) -> None:
+        with self._lock, self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE stores SET thread_id = %s WHERE slug = %s",
+                (thread_id, slug),
+            )
+
+    def mark_store_seeded(self, slug: str) -> None:
+        with self._lock, self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE stores SET seeded = TRUE WHERE slug = %s",
+                (slug,),
+            )
+
+    def get_store(self, slug: str) -> Store | None:
+        with self._lock, self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT slug, name, thread_id, seeded FROM stores WHERE slug = %s",
+                (slug,),
+            )
+            row = cur.fetchone()
+        return store_from_row(row) if row else None
+
+    def all_stores(self) -> list[Store]:
+        with self._lock, self.connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT slug, name, thread_id, seeded FROM stores ORDER BY name")
+            rows = cur.fetchall()
+        return [store_from_row(row) for row in rows]
+
     def insert_listing_if_new(self, listing: Listing) -> bool:
         with self._lock, self.connect() as conn, conn.cursor() as cur:
             try:
                 cur.execute(
                     """
                     INSERT INTO listings
-                    (id, source, brand, title, price, url, image_url, sent, first_seen_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, %s)
+                    (id, source, brand, store, title, price, url, image_url, sent, first_seen_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, FALSE, %s)
                     """,
                     (
                         listing.id,
                         listing.source,
                         listing.brand,
+                        listing.store,
                         listing.title,
                         listing.price,
                         listing.url,
@@ -410,6 +586,14 @@ class PostgresDatabase:
                 return True
             except psycopg.IntegrityError:
                 return False
+
+    def mark_existing_listings_sent_for_store(self, store_slug: str) -> int:
+        with self._lock, self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE listings SET sent = TRUE, posted_at = %s WHERE store = %s AND sent = FALSE",
+                (now_iso(), store_slug),
+            )
+            return cur.rowcount
 
     def mark_sent(self, listing: Listing) -> None:
         with self._lock, self.connect() as conn, conn.cursor() as cur:
@@ -422,10 +606,15 @@ class PostgresDatabase:
         with self._lock, self.connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT l.source, l.brand, l.title, l.price, l.url, l.image_url
+                SELECT l.source, l.brand, l.store, l.title, l.price, l.url, l.image_url
                 FROM listings AS l
-                JOIN brands AS b ON b.name = l.brand
-                WHERE l.sent = FALSE AND b.active = TRUE
+                LEFT JOIN brands AS b ON l.store IS NULL AND b.name = l.brand
+                LEFT JOIN stores AS s ON l.store IS NOT NULL AND s.slug = l.store
+                WHERE l.sent = FALSE
+                  AND (
+                    (l.store IS NULL AND b.active = TRUE)
+                    OR (l.store IS NOT NULL AND s.thread_id IS NOT NULL)
+                  )
                 ORDER BY l.first_seen_at ASC
                 LIMIT %s
                 """,
@@ -485,12 +674,16 @@ def migrate_sqlite_to_postgres(sqlite_path: Path, postgres: PostgresDatabase) ->
             ORDER BY name
             """
         ).fetchall()
+        listings_cols = sqlite_conn.execute("PRAGMA table_info(listings)").fetchall()
+        has_store_col = any(row["name"] == "store" for row in listings_cols)
+        listings_select_store = "store" if has_store_col else "NULL AS store"
         listing_rows = sqlite_conn.execute(
-            """
+            f"""
             SELECT
                 id,
                 source,
                 brand,
+                {listings_select_store},
                 title,
                 price,
                 url,
@@ -502,6 +695,17 @@ def migrate_sqlite_to_postgres(sqlite_path: Path, postgres: PostgresDatabase) ->
             ORDER BY first_seen_at, id
             """
         ).fetchall()
+        try:
+            store_cols = sqlite_conn.execute("PRAGMA table_info(stores)").fetchall()
+            store_select_seeded = (
+                "seeded" if any(row["name"] == "seeded" for row in store_cols) else "0 AS seeded"
+            )
+            store_rows = sqlite_conn.execute(
+                f"SELECT slug, name, thread_id, {store_select_seeded}, created_at "
+                "FROM stores ORDER BY slug"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            store_rows = []
         status_rows = sqlite_conn.execute(
             """
             SELECT source, brand, ok, last_run_at, last_error
@@ -536,10 +740,32 @@ def migrate_sqlite_to_postgres(sqlite_path: Path, postgres: PostgresDatabase) ->
         )
         cur.executemany(
             """
+            INSERT INTO stores (slug, name, thread_id, seeded, created_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT(slug) DO UPDATE SET
+                name = excluded.name,
+                thread_id = excluded.thread_id,
+                seeded = excluded.seeded,
+                created_at = excluded.created_at
+            """,
+            [
+                (
+                    row["slug"],
+                    row["name"],
+                    row["thread_id"],
+                    bool(row["seeded"]),
+                    row["created_at"],
+                )
+                for row in store_rows
+            ],
+        )
+        cur.executemany(
+            """
             INSERT INTO listings (
                 id,
                 source,
                 brand,
+                store,
                 title,
                 price,
                 url,
@@ -548,10 +774,11 @@ def migrate_sqlite_to_postgres(sqlite_path: Path, postgres: PostgresDatabase) ->
                 sent,
                 first_seen_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT(id) DO UPDATE SET
                 source = excluded.source,
                 brand = excluded.brand,
+                store = excluded.store,
                 title = excluded.title,
                 price = excluded.price,
                 url = excluded.url,
@@ -565,6 +792,7 @@ def migrate_sqlite_to_postgres(sqlite_path: Path, postgres: PostgresDatabase) ->
                     row["id"],
                     row["source"],
                     row["brand"],
+                    row["store"],
                     row["title"],
                     row["price"],
                     row["url"],
@@ -599,6 +827,7 @@ def migrate_sqlite_to_postgres(sqlite_path: Path, postgres: PostgresDatabase) ->
 
     return {
         "brands": len(brand_rows),
+        "stores": len(store_rows),
         "listings": len(listing_rows),
         "parser_status": len(status_rows),
     }
@@ -624,6 +853,15 @@ def brand_from_row(row, thread_id: int | None = None) -> Brand:
     )
 
 
+def store_from_row(row) -> Store:
+    return Store(
+        slug=row["slug"],
+        name=row["name"],
+        thread_id=row["thread_id"],
+        seeded=bool(row["seeded"]),
+    )
+
+
 def listings_from_rows(rows) -> list[Listing]:
     return [
         Listing(
@@ -633,6 +871,7 @@ def listings_from_rows(rows) -> list[Listing]:
             price=row["price"],
             url=row["url"],
             image_url=row["image_url"],
+            store=row["store"],
         )
         for row in rows
     ]

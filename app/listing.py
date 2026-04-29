@@ -12,6 +12,7 @@ class Listing:
     price: str
     url: str
     image_url: str | None = None
+    store: str | None = None
 
     @property
     def id(self) -> str:

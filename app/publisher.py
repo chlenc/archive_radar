@@ -30,10 +30,16 @@ class Publisher:
         self.chat_id = chat_id
 
     async def publish(self, brand: Brand, listing: Listing) -> None:
+        await self._send(brand.thread_id, listing)
+
+    async def publish_to_thread(self, thread_id: int, listing: Listing) -> None:
+        await self._send(thread_id, listing)
+
+    async def _send(self, thread_id: int | None, listing: Listing) -> None:
         caption = format_caption(listing)
         kwargs: dict[str, object] = {"chat_id": self.chat_id}
-        if brand.thread_id:
-            kwargs["message_thread_id"] = brand.thread_id
+        if thread_id:
+            kwargs["message_thread_id"] = thread_id
 
         for attempt in range(3):
             try:

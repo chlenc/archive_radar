@@ -5,18 +5,44 @@ import asyncio
 import logging
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.bot import create_dispatcher
-from app.config import load_settings
-from app.database import PostgresDatabase, build_database, migrate_sqlite_to_postgres
+from app.config import Settings, load_settings
+from app.database import Database, PostgresDatabase, build_database, migrate_sqlite_to_postgres
 from app.parsers.goofish import GoofishParser
 from app.publisher import Publisher
+from app.stores import STORES
 from app.utils import ensure_dirs, setup_logging, write_json_env_file
 from app.worker import ParserWorker
 
 logger = logging.getLogger(__name__)
+
+
+async def ensure_store_topics(bot: Bot, db: Database, settings: Settings) -> None:
+    if not settings.telegram_chat_id:
+        logger.warning("TELEGRAM_CHAT_ID is not set; skipping store topic bootstrap.")
+        return
+    for config in STORES:
+        store = db.upsert_store(config.slug, config.name)
+        if store.thread_id:
+            continue
+        try:
+            topic = await bot.create_forum_topic(
+                chat_id=settings.telegram_chat_id,
+                name=config.topic_name,
+            )
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            logger.warning(
+                "Could not create forum topic for store %s: %s", config.name, exc,
+            )
+            continue
+        db.set_store_thread(config.slug, topic.message_thread_id)
+        logger.info(
+            "Created forum topic for store %s (thread_id=%s)",
+            config.name, topic.message_thread_id,
+        )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -49,6 +75,7 @@ async def init_runtime():
     db.init()
     db.seed_from_yaml(settings.brands_file)
     bot = Bot(token=settings.telegram_bot_token)
+    await ensure_store_topics(bot, db, settings)
     publisher = Publisher(bot, db, settings.telegram_chat_id)
     worker = ParserWorker(settings, db, publisher)
     return settings, db, bot, publisher, worker
@@ -179,6 +206,7 @@ async def cmd_migrate_to_postgres() -> None:
     print(
         "Migrated SQLite to Postgres: "
         f"brands={summary['brands']}, "
+        f"stores={summary['stores']}, "
         f"listings={summary['listings']}, "
         f"parser_status={summary['parser_status']}"
     )

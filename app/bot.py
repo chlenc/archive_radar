@@ -144,14 +144,33 @@ def create_dispatcher(settings: Settings, db: Database, bot: Bot) -> Dispatcher:
         ]
         await message.answer("Active brands:\n" + "\n".join(lines))
 
+    @router.message(Command("list_stores"))
+    async def list_stores(message: Message) -> None:
+        if await deny_if_not_admin(message):
+            return
+        stores = db.all_stores()
+        if not stores:
+            await message.answer("No stores registered yet.")
+            return
+        lines = []
+        for store in stores:
+            seeded = "seeded" if store.seeded else "seeding"
+            thread = store.thread_id if store.thread_id else "missing"
+            lines.append(f"- {store.name} (thread_id={thread}, {seeded})")
+        await message.answer(
+            "Stores (hardcoded, not editable):\n" + "\n".join(lines)
+        )
+
     @router.message(Command("status"))
     async def status(message: Message) -> None:
         if await deny_if_not_admin(message):
             return
         brands = db.active_brands()
+        stores = db.all_stores()
         statuses = db.statuses()
         lines = [
             f"Active brands: {len(brands)}",
+            f"Stores: {len(stores)}",
             f"Unsent listings: {db.unsent_count()}",
         ]
         if statuses:
@@ -167,7 +186,8 @@ def create_dispatcher(settings: Settings, db: Database, bot: Bot) -> Dispatcher:
         if await deny_if_not_admin(message):
             return
         await message.answer(
-            "Commands: /add_brand, /bind_brand, /remove_brand, /list_brands, /status, /whoami"
+            "Commands: /add_brand, /bind_brand, /remove_brand, /list_brands, "
+            "/list_stores, /status, /whoami"
         )
 
     dp = Dispatcher()

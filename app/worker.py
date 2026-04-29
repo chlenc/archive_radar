@@ -5,9 +5,10 @@ import contextlib
 import logging
 
 from app.config import Settings
-from app.database import Brand, Database
-from app.parsers import GoofishParser, GrailedParser
+from app.database import Brand, Database, Store
+from app.parsers import GoofishParser, GrailedParser, ShopifyParser
 from app.publisher import Publisher
+from app.stores import STORES_BY_SLUG
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,10 @@ class ParserWorker:
             max_items=settings.max_items_per_source,
             proxy_url=settings.goofish_proxy_url,
         )
+        self.shopify = ShopifyParser(
+            timeout_ms=settings.parser_timeout_ms,
+            max_items=settings.max_items_per_source,
+        )
 
     def _record_status(self, source: str, brand: str, ok: bool, error: str | None = None) -> None:
         try:
@@ -51,14 +56,25 @@ class ParserWorker:
                 brands = self.db.active_brands()
             except Exception:
                 logger.exception("Failed to load active brands; skipping cycle.")
-                return
-            if not brands:
-                logger.info("No active brands configured")
+                brands = []
+            try:
+                stores = [
+                    store
+                    for store in self.db.all_stores()
+                    if store.slug in STORES_BY_SLUG and store.thread_id is not None
+                ]
+            except Exception:
+                logger.exception("Failed to load stores; skipping store fetch this cycle.")
+                stores = []
+            if not brands and not stores:
+                logger.info("No active brands or stores configured")
                 return
             brands_by_name = {brand.name: brand for brand in brands}
+            stores_by_slug = {store.slug: store for store in stores}
 
-            grailed_ctx = self.grailed if self.settings.grailed_enabled else None
-            goofish_ctx = self._goofish_or_none()
+            grailed_ctx = self.grailed if (brands and self.settings.grailed_enabled) else None
+            goofish_ctx = self._goofish_or_none() if brands else None
+            shopify_ctx = self.shopify if stores else None
 
             async with contextlib.AsyncExitStack() as stack:
                 if grailed_ctx is not None:
@@ -73,11 +89,21 @@ class ParserWorker:
                     except Exception:
                         logger.exception("Failed to start Goofish browser; skipping Goofish this cycle.")
                         goofish_ctx = None
+                if shopify_ctx is not None:
+                    try:
+                        await stack.enter_async_context(shopify_ctx)
+                    except Exception:
+                        logger.exception("Failed to start Shopify session; skipping stores this cycle.")
+                        shopify_ctx = None
 
                 for brand in brands:
                     await self.run_brand(brand, grailed_ctx, goofish_ctx)
 
-            await self.flush_pending(brands_by_name)
+                if shopify_ctx is not None:
+                    for store in stores:
+                        await self.run_store(store, shopify_ctx)
+
+            await self.flush_pending(brands_by_name, stores_by_slug)
 
     def _goofish_or_none(self) -> GoofishParser | None:
         if not self.settings.goofish_enabled:
@@ -140,7 +166,43 @@ class ParserWorker:
             logger.exception("%s/%s failed", source, brand.name)
             self._record_status(source, brand.name, ok=False, error=str(exc)[:1000])
 
-    async def flush_pending(self, brands_by_name: dict[str, Brand]) -> None:
+    async def run_store(self, store: Store, shopify: ShopifyParser) -> None:
+        config = STORES_BY_SLUG.get(store.slug)
+        if config is None:
+            return
+        source = shopify.source
+        try:
+            listings = await shopify.fetch(config)
+            inserted = 0
+            for listing in listings:
+                try:
+                    if self.db.insert_listing_if_new(listing):
+                        inserted += 1
+                except Exception:
+                    logger.exception(
+                        "Failed to persist store listing %s; skipping.", listing.url,
+                    )
+            if not store.seeded:
+                suppressed = self.db.mark_existing_listings_sent_for_store(store.slug)
+                self.db.mark_store_seeded(store.slug)
+                logger.info(
+                    "%s/%s: initial seed suppressed=%s (no backlog spam)",
+                    source, store.name, suppressed,
+                )
+            self._record_status(source, store.name, ok=True)
+            logger.info(
+                "%s/%s: fetched=%s inserted=%s",
+                source, store.name, len(listings), inserted,
+            )
+        except Exception as exc:
+            logger.exception("%s/%s failed", source, store.name)
+            self._record_status(source, store.name, ok=False, error=str(exc)[:1000])
+
+    async def flush_pending(
+        self,
+        brands_by_name: dict[str, Brand],
+        stores_by_slug: dict[str, Store],
+    ) -> None:
         try:
             pending = self.db.pending_listings(self.settings.max_sends_per_run)
         except Exception:
@@ -151,6 +213,25 @@ class ParserWorker:
 
         logger.info("Publishing up to %s pending listings", len(pending))
         for listing in pending:
+            if listing.store:
+                store = stores_by_slug.get(listing.store)
+                if not store or not store.thread_id:
+                    logger.warning(
+                        "Skipping pending store listing without active thread: %s",
+                        listing.url,
+                    )
+                    continue
+                try:
+                    await self.publisher.publish_to_thread(store.thread_id, listing)
+                except Exception as exc:
+                    logger.exception(
+                        "Publish failed for %s/%s", listing.source, listing.brand,
+                    )
+                    self._record_status(
+                        listing.source, listing.brand, ok=False, error=str(exc)[:1000],
+                    )
+                continue
+
             brand = brands_by_name.get(listing.brand)
             if not brand or not brand.thread_id:
                 logger.warning("Skipping pending listing without active thread: %s", listing.url)
