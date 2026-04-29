@@ -1,0 +1,29 @@
+[project]
+name = "marketplace-telegram-parser"
+version = "0.1.0"
+description = "Goofish and Grailed parser that posts new listings to Telegram forum topics."
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram>=3.5,<4",
+    "apscheduler>=3.10,<4",
+    "playwright>=1.45,<2",
+    "psycopg[binary]>=3.2,<4",
+    "python-dotenv>=1.0,<2",
+    "pyyaml>=6.0,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5,<1",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

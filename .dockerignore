@@ -1,0 +1,13 @@
+.env
+.git/
+.ruff_cache/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+data/
+debug/
+logs/
+state/
+.DS_Store
+
