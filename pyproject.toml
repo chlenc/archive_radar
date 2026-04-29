@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "aiogram>=3.5,<4",
     "apscheduler>=3.10,<4",
-    "playwright>=1.45,<2",
+    "playwright==1.58.0",
     "psycopg[binary]>=3.2,<4",
     "python-dotenv>=1.0,<2",
     "pyyaml>=6.0,<7",
