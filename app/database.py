@@ -57,6 +57,8 @@ class Database(Protocol):
 
     def set_brand_thread(self, name: str, thread_id: int) -> None: ...
 
+    def clear_brand_thread(self, name: str) -> None: ...
+
     def remove_brand(self, name: str) -> bool: ...
 
     def get_brand(self, name: str) -> Brand | None: ...
@@ -66,6 +68,8 @@ class Database(Protocol):
     def upsert_store(self, slug: str, name: str) -> Store: ...
 
     def set_store_thread(self, slug: str, thread_id: int) -> None: ...
+
+    def clear_store_thread(self, slug: str) -> None: ...
 
     def mark_store_seeded(self, slug: str) -> None: ...
 
@@ -196,6 +200,13 @@ class SQLiteDatabase:
                 (thread_id, name.strip()),
             )
 
+    def clear_brand_thread(self, name: str) -> None:
+        with self._lock, self.connect() as conn:
+            conn.execute(
+                "UPDATE brands SET thread_id = NULL WHERE lower(name) = lower(?)",
+                (name.strip(),),
+            )
+
     def remove_brand(self, name: str) -> bool:
         with self._lock, self.connect() as conn:
             cur = conn.execute(
@@ -253,6 +264,13 @@ class SQLiteDatabase:
             conn.execute(
                 "UPDATE stores SET thread_id = ? WHERE slug = ?",
                 (thread_id, slug),
+            )
+
+    def clear_store_thread(self, slug: str) -> None:
+        with self._lock, self.connect() as conn:
+            conn.execute(
+                "UPDATE stores SET thread_id = NULL, seeded = 0 WHERE slug = ?",
+                (slug,),
             )
 
     def mark_store_seeded(self, slug: str) -> None:
@@ -477,6 +495,13 @@ class PostgresDatabase:
                 (thread_id, name.strip()),
             )
 
+    def clear_brand_thread(self, name: str) -> None:
+        with self._lock, self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE brands SET thread_id = NULL WHERE lower(name) = lower(%s)",
+                (name.strip(),),
+            )
+
     def remove_brand(self, name: str) -> bool:
         with self._lock, self.connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -538,6 +563,13 @@ class PostgresDatabase:
             cur.execute(
                 "UPDATE stores SET thread_id = %s WHERE slug = %s",
                 (thread_id, slug),
+            )
+
+    def clear_store_thread(self, slug: str) -> None:
+        with self._lock, self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE stores SET thread_id = NULL, seeded = FALSE WHERE slug = %s",
+                (slug,),
             )
 
     def mark_store_seeded(self, slug: str) -> None:

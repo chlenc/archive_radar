@@ -222,7 +222,7 @@ class ParserWorker:
                     )
                     continue
                 try:
-                    await self.publisher.publish_to_thread(store.thread_id, listing)
+                    await self.publisher.publish_to_store(store, listing)
                 except Exception as exc:
                     logger.exception(
                         "Publish failed for %s/%s", listing.source, listing.brand,
