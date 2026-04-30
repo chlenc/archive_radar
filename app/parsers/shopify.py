@@ -106,6 +106,7 @@ class ShopifyParser:
             price=price,
             url=url,
             image_url=image_url,
+            store=store.slug,
         )
 
     def _format_price(self, product: dict[str, Any]) -> str:
