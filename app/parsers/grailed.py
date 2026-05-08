@@ -118,7 +118,9 @@ class GrailedParser:
             content_type = response.headers.get("content-type", "")
             if "json" not in content_type:
                 return
-            if "grailed.com" not in response.url:
+            url = response.url
+            # Grailed proxies search through algolia.net; capture both.
+            if "grailed.com" not in url and "algolia" not in url:
                 return
             try:
                 captured.append(await response.json())
@@ -140,6 +142,8 @@ class GrailedParser:
                 await page.wait_for_timeout(1500)
                 listings = self._extract_json_listings(brand, captured)
                 if len(listings) >= 3:
+                    # Got initial page; scroll to load more until we hit max_items
+                    listings = await self._scroll_for_more(page, brand, captured, listings)
                     break
                 listings = await self._extract_dom_listings(page, brand)
                 if listings:
@@ -289,6 +293,44 @@ class GrailedParser:
                     return
             except Exception:
                 continue
+
+    async def _scroll_for_more(
+        self,
+        page,
+        brand: str,
+        captured: list[dict[str, Any]],
+        current: list[Listing],
+        max_scrolls: int = 8,
+    ) -> list[Listing]:
+        """Trigger Algolia infinite scroll until we have max_items listings or scrolls stall.
+
+        Critical at slow polling intervals (e.g. hourly): without this we'd only ever
+        see the first ~12-40 listings on the page, missing anything older that
+        happened between cycles.
+        """
+        listings = current
+        target = self.max_items
+        if len(listings) >= target:
+            return listings
+        last_response_count = len(captured)
+        stalls = 0
+        for _ in range(max_scrolls):
+            if len(listings) >= target:
+                break
+            try:
+                await page.mouse.wheel(0, 2500)
+            except Exception:
+                break
+            await page.wait_for_timeout(1500)
+            if len(captured) > last_response_count:
+                last_response_count = len(captured)
+                stalls = 0
+            else:
+                stalls += 1
+                if stalls >= 2:
+                    break
+            listings = self._extract_json_listings(brand, captured)
+        return listings
 
     def _extract_json_listings(self, brand: str, payloads: list[dict[str, Any]]) -> list[Listing]:
         raw_items: list[dict[str, Any]] = []
