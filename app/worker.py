@@ -149,7 +149,18 @@ class ParserWorker:
     async def _run_source(self, parser, brand: Brand) -> None:
         source = parser.source
         try:
-            listings = await parser.fetch(brand.name)
+            # Pre-load URLs we already know for this (source, brand). The parser
+            # uses this to stop scrolling once it sees only known listings —
+            # saves proxy bandwidth on subsequent cycles.
+            try:
+                known = self.db.known_urls(source, brand.name)
+            except Exception:
+                logger.warning(
+                    "Failed to load known_urls for %s/%s; will fetch full window",
+                    source, brand.name, exc_info=True,
+                )
+                known = None
+            listings = await parser.fetch(brand.name, known_urls=known)
             queued = 0
             for listing in listings:
                 try:

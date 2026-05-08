@@ -79,6 +79,8 @@ class Database(Protocol):
 
     def insert_listing_if_new(self, listing: Listing) -> bool: ...
 
+    def known_urls(self, source: str, brand: str) -> set[str]: ...
+
     def mark_existing_listings_sent_for_store(self, store_slug: str) -> int: ...
 
     def mark_sent(self, listing: Listing) -> None: ...
@@ -319,6 +321,14 @@ class SQLiteDatabase:
                 return True
             except sqlite3.IntegrityError:
                 return False
+
+    def known_urls(self, source: str, brand: str) -> set[str]:
+        with self._lock, self.connect() as conn:
+            rows = conn.execute(
+                "SELECT url FROM listings WHERE source = ? AND brand = ?",
+                (source, brand),
+            ).fetchall()
+        return {row["url"] for row in rows}
 
     def mark_existing_listings_sent_for_store(self, store_slug: str) -> int:
         with self._lock, self.connect() as conn:
@@ -618,6 +628,15 @@ class PostgresDatabase:
                 return True
             except psycopg.IntegrityError:
                 return False
+
+    def known_urls(self, source: str, brand: str) -> set[str]:
+        with self._lock, self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT url FROM listings WHERE source = %s AND brand = %s",
+                (source, brand),
+            )
+            rows = cur.fetchall()
+        return {row["url"] for row in rows}
 
     def mark_existing_listings_sent_for_store(self, store_slug: str) -> int:
         with self._lock, self.connect() as conn, conn.cursor() as cur:

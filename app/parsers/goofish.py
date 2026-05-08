@@ -91,7 +91,9 @@ class GoofishParser:
             self._browser = None
             self._pw = None
 
-    async def fetch(self, brand: str) -> list[Listing]:
+    async def fetch(
+        self, brand: str, known_urls: set[str] | None = None,  # noqa: ARG002
+    ) -> list[Listing]:
         if self._context is None:
             async with self:
                 return await self._fetch_with_context(brand)

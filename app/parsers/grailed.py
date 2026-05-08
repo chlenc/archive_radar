@@ -95,13 +95,15 @@ class GrailedParser:
             self._browser = None
             self._pw = None
 
-    async def fetch(self, brand: str) -> list[Listing]:
+    async def fetch(self, brand: str, known_urls: set[str] | None = None) -> list[Listing]:
         if self._context is None:
             async with self:
-                return await self._fetch_with_context(brand)
-        return await self._fetch_with_context(brand)
+                return await self._fetch_with_context(brand, known_urls)
+        return await self._fetch_with_context(brand, known_urls)
 
-    async def _fetch_with_context(self, brand: str) -> list[Listing]:
+    async def _fetch_with_context(
+        self, brand: str, known_urls: set[str] | None = None,
+    ) -> list[Listing]:
         assert self._context is not None
         captured: list[dict[str, Any]] = []
         slug = slugify(brand)
@@ -143,7 +145,10 @@ class GrailedParser:
                 listings = self._extract_json_listings(brand, captured)
                 if len(listings) >= 3:
                     # Got initial page; scroll to load more until we hit max_items
-                    listings = await self._scroll_for_more(page, brand, captured, listings)
+                    # or we recognize that we've caught up to known listings.
+                    listings = await self._scroll_for_more(
+                        page, brand, captured, listings, known_urls,
+                    )
                     break
                 listings = await self._extract_dom_listings(page, brand)
                 if listings:
@@ -300,13 +305,19 @@ class GrailedParser:
         brand: str,
         captured: list[dict[str, Any]],
         current: list[Listing],
+        known_urls: set[str] | None = None,
         max_scrolls: int = 8,
     ) -> list[Listing]:
         """Trigger Algolia infinite scroll until we have max_items listings or scrolls stall.
 
-        Critical at slow polling intervals (e.g. hourly): without this we'd only ever
-        see the first ~12-40 listings on the page, missing anything older that
-        happened between cycles.
+        At slow polling intervals (e.g. hourly): without scrolling we'd only see the
+        first ~12-40 listings on the page, missing anything older that appeared
+        between cycles. So we scroll deep on first pass.
+
+        Once we know about prior listings (known_urls), we can stop early: if 2
+        consecutive scrolls add only listings we've already seen in DB, we've
+        caught up to the historical archive — no point burning more proxy
+        bandwidth fetching pages full of dupes.
         """
         listings = current
         target = self.max_items
@@ -314,6 +325,9 @@ class GrailedParser:
             return listings
         last_response_count = len(captured)
         stalls = 0
+        if known_urls is not None:
+            prev_new = sum(1 for x in listings if x.url not in known_urls)
+            no_new_streak = 0
         for _ in range(max_scrolls):
             if len(listings) >= target:
                 break
@@ -330,6 +344,18 @@ class GrailedParser:
                 if stalls >= 2:
                     break
             listings = self._extract_json_listings(brand, captured)
+
+            if known_urls is not None:
+                cur_new = sum(1 for x in listings if x.url not in known_urls)
+                if cur_new == prev_new:
+                    no_new_streak += 1
+                    if no_new_streak >= 2:
+                        # 2 scrolls in a row produced no new listings vs DB —
+                        # we've reached the part of the feed we already know.
+                        break
+                else:
+                    no_new_streak = 0
+                    prev_new = cur_new
         return listings
 
     def _extract_json_listings(self, brand: str, payloads: list[dict[str, Any]]) -> list[Listing]:
