@@ -16,3 +16,4 @@ logs/*.out
 run/*.pid
 debug/*
 !debug/.gitkeep
+.claude/
