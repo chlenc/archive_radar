@@ -19,6 +19,7 @@ class ParserWorker:
         self.db = db
         self.publisher = publisher
         self._lock = asyncio.Lock()
+        self._flush_lock = asyncio.Lock()
         self.grailed = GrailedParser(
             storage_state=settings.grailed_storage_state,
             headless=settings.grailed_headless,
@@ -103,6 +104,33 @@ class ParserWorker:
                     for store in stores:
                         await self.run_store(store, shopify_ctx)
 
+            await self.flush_pending(brands_by_name, stores_by_slug)
+
+    async def flush_only(self) -> None:
+        """Publish pending listings without re-parsing.
+
+        Designed to run on a faster cadence than run_once so backlog drains
+        smoothly instead of in big bursts at the top of each parse cycle.
+        """
+        if self._flush_lock.locked():
+            return
+        async with self._flush_lock:
+            try:
+                brands = self.db.active_brands()
+            except Exception:
+                logger.exception("flush_only: failed to load brands; skipping.")
+                return
+            try:
+                stores = [
+                    store
+                    for store in self.db.all_stores()
+                    if store.slug in STORES_BY_SLUG and store.thread_id is not None
+                ]
+            except Exception:
+                logger.exception("flush_only: failed to load stores; skipping.")
+                stores = []
+            brands_by_name = {b.name: b for b in brands}
+            stores_by_slug = {s.slug: s for s in stores}
             await self.flush_pending(brands_by_name, stores_by_slug)
 
     def _goofish_or_none(self) -> GoofishParser | None:

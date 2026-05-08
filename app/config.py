@@ -44,6 +44,7 @@ class Settings:
     parser_timeout_ms: int
     max_items_per_source: int
     max_sends_per_run: int
+    flush_interval_seconds: int
     log_file: Path
 
     @property
@@ -87,5 +88,12 @@ def load_settings() -> Settings:
         parser_timeout_ms=_int(os.getenv("PARSER_TIMEOUT_MS"), 30000),
         max_items_per_source=_int(os.getenv("MAX_ITEMS_PER_SOURCE"), 12),
         max_sends_per_run=_int(os.getenv("MAX_SENDS_PER_RUN"), 8),
+        # If FLUSH_INTERVAL_SECONDS is unset, defaults to poll_interval (no
+        # behavior change). Set lower than POLL_INTERVAL_SECONDS to drain the
+        # backlog smoothly instead of in big hourly bursts.
+        flush_interval_seconds=_int(
+            os.getenv("FLUSH_INTERVAL_SECONDS"),
+            _int(os.getenv("POLL_INTERVAL_SECONDS"), 60),
+        ),
         log_file=Path(os.getenv("LOG_FILE", "logs/app.log")),
     )

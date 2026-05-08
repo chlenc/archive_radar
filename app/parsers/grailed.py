@@ -325,9 +325,6 @@ class GrailedParser:
             return listings
         last_response_count = len(captured)
         stalls = 0
-        if known_urls is not None:
-            prev_new = sum(1 for x in listings if x.url not in known_urls)
-            no_new_streak = 0
         for _ in range(max_scrolls):
             if len(listings) >= target:
                 break
@@ -345,17 +342,15 @@ class GrailedParser:
                     break
             listings = self._extract_json_listings(brand, captured)
 
-            if known_urls is not None:
-                cur_new = sum(1 for x in listings if x.url not in known_urls)
-                if cur_new == prev_new:
-                    no_new_streak += 1
-                    if no_new_streak >= 2:
-                        # 2 scrolls in a row produced no new listings vs DB —
-                        # we've reached the part of the feed we already know.
-                        break
-                else:
-                    no_new_streak = 0
-                    prev_new = cur_new
+            # Ratio-based early exit: once we have a meaningful page (>=15 listings)
+            # AND fewer than 20% are new vs DB, we've crossed into the historical
+            # archive. Any further scrolling is mostly fetching dupes through the
+            # paid proxy.
+            if known_urls is not None and len(listings) >= 15:
+                new_count = sum(1 for x in listings if x.url not in known_urls)
+                new_ratio = new_count / len(listings)
+                if new_ratio < 0.2:
+                    break
         return listings
 
     def _extract_json_listings(self, brand: str, payloads: list[dict[str, Any]]) -> list[Listing]:

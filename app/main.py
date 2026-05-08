@@ -93,6 +93,22 @@ async def cmd_worker() -> None:
         max_instances=1,
         coalesce=True,
     )
+    # Optional separate publish schedule. Smooths out the hourly burst by
+    # running flush_pending on a tighter cadence (e.g. every 10 min) without
+    # hitting the proxy for additional parsing.
+    if settings.flush_interval_seconds < settings.poll_interval_seconds:
+        scheduler.add_job(
+            worker.flush_only,
+            "interval",
+            seconds=settings.flush_interval_seconds,
+            id="publish-flush",
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info(
+            "Smooth publishing enabled. Flush interval: %s seconds",
+            settings.flush_interval_seconds,
+        )
     scheduler.start()
     logger.info("Worker started. Poll interval: %s seconds", settings.poll_interval_seconds)
 
