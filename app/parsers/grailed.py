@@ -65,6 +65,16 @@ class GrailedParser:
             context_kwargs["storage_state"] = str(self.storage_state)
         self._context = await self._browser.new_context(**context_kwargs)
         await self._context.add_init_script(STEALTH_INIT_SCRIPT)
+        # Block heavy assets to slash residential-proxy bandwidth (~10x reduction).
+        # JSON/JS/HTML still pass through, which is what the parser actually needs.
+        await self._context.route(
+            "**/*",
+            lambda route: (
+                route.abort()
+                if route.request.resource_type in {"image", "font", "stylesheet", "media"}
+                else route.continue_()
+            ),
+        )
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
