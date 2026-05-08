@@ -325,6 +325,11 @@ class GrailedParser:
             return listings
         last_response_count = len(captured)
         stalls = 0
+        # Pre-compute known paths once. Grailed URLs have per-request tracking
+        # params (g_aidx, g_aqid) so naive set lookup misses everything.
+        known_paths = (
+            {u.split("?", 1)[0] for u in known_urls} if known_urls else None
+        )
         for _ in range(max_scrolls):
             if len(listings) >= target:
                 break
@@ -346,8 +351,10 @@ class GrailedParser:
             # AND fewer than 20% are new vs DB, we've crossed into the historical
             # archive. Any further scrolling is mostly fetching dupes through the
             # paid proxy.
-            if known_urls is not None and len(listings) >= 15:
-                new_count = sum(1 for x in listings if x.url not in known_urls)
+            if known_paths is not None and len(listings) >= 15:
+                new_count = sum(
+                    1 for x in listings if x.url.split("?", 1)[0] not in known_paths
+                )
                 new_ratio = new_count / len(listings)
                 if new_ratio < 0.2:
                     break
