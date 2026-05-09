@@ -25,9 +25,19 @@ class ShopifyParser:
 
     async def __aenter__(self) -> "ShopifyParser":
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        # Shopify (or their Cloudflare) started rejecting "Accept: application/json"
+        # as a bot signature in mid-May 2026. Browser-like headers pass cleanly.
+        # NOTE: omit "br" from Accept-Encoding — aiohttp can't decode brotli
+        # without the Brotli package, and adding a Python dep just for this
+        # isn't worth it; gzip/deflate are sufficient.
         self._session = aiohttp.ClientSession(
             timeout=timeout,
-            headers={"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"},
+            headers={
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate",
+            },
         )
         return self
 
