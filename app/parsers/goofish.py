@@ -23,6 +23,34 @@ from app.utils import clean_line, quote_query
 
 logger = logging.getLogger(__name__)
 
+# Goofish/Xianyu item ids appear as bare digits, as ?id=N (both the canonical
+# https item URL and the fleamarket:// app deep link), or as /item/N.
+_ITEM_ID_RE = re.compile(r"(?:[?&]id=|/item/)(\d+)")
+
+
+def goofish_item_id(*sources: Any) -> str:
+    """Best-effort numeric item id from any id field or URL form.
+
+    The search API returns each item under several node shapes: a rich wrapper
+    whose targetUrl is a ``fleamarket://item?id=N&referPageArgs=...`` app deep
+    link, plus bare ``{itemId, title}`` sub-nodes. Collapsing everything to the
+    numeric id lets us build one canonical URL and dedupe reliably.
+    """
+    for source in sources:
+        text = clean_line(source)
+        if not text:
+            continue
+        if text.isdigit():
+            return text
+        match = _ITEM_ID_RE.search(text)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def goofish_item_url(item_id: str) -> str:
+    return f"https://www.goofish.com/item?id={item_id}"
+
 
 class GoofishParser:
     source = "Goofish"
@@ -121,10 +149,18 @@ class GoofishParser:
         try:
             url = f"https://www.goofish.com/search?q={quote_query(brand)}"
             await page.goto(url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2500)
+            await self._wait_for_search_results(page)
             await self._try_click_newest(page)
-            await page.wait_for_timeout(2500)
-            listings = self._extract_json_listings(brand, captured)
+            # The newest-sort fires a second search; response bodies are read
+            # into `captured` by an async handler. Poll a short window instead
+            # of racing a fixed sleep (a too-short sleep silently yields 0).
+            await page.wait_for_timeout(1200)
+            listings: list[Listing] = []
+            for _ in range(6):
+                listings = self._extract_json_listings(brand, captured)
+                if listings:
+                    break
+                await page.wait_for_timeout(700)
             if not listings:
                 listings = await self._extract_dom_listings(page, brand)
             return listings[: self.max_items]
@@ -154,6 +190,24 @@ class GoofishParser:
             await context.storage_state(path=str(self.storage_state))
             await browser.close()
             print(f"Saved Goofish storage state to {self.storage_state}")
+
+    async def _wait_for_search_results(self, page) -> None:
+        """Block on the PC search results API instead of a blind sleep.
+
+        The search page is a SPA: after domcontentloaded it issues the
+        ``mtop.taobao.idlemtopsearch.pc.search`` XHR whose JSON carries the
+        items. A fixed 2.5s wait raced that request and sometimes extracted
+        nothing; waiting for the response makes each fetch deterministic.
+        """
+        try:
+            await page.wait_for_response(
+                lambda r: "idlemtopsearch.pc.search/" in r.url and r.status == 200,
+                timeout=min(self.timeout_ms, 12000),
+            )
+            # let the response handler finish reading the body into `captured`
+            await page.wait_for_timeout(500)
+        except Exception:
+            await page.wait_for_timeout(2500)
 
     async def _try_click_newest(self, page) -> None:
         for text in ("新发", "最新", "New"):
@@ -206,15 +260,25 @@ class GoofishParser:
         if not isinstance(content, dict):
             content = item
 
-        item_id = clean_line(content.get("itemId") or content.get("id"))
+        main_target = main.get("targetUrl") if isinstance(main, dict) else None
+        item_id = goofish_item_id(
+            content.get("itemId"),
+            content.get("id"),
+            main_target,
+            content.get("targetUrl"),
+            content.get("url"),
+        )
         title = clean_line(content.get("title") or content.get("name"))
         price = self._format_price(content.get("price") or content.get("priceInfo") or content.get("soldPrice"))
         image_url = first_image(content.get("picUrl") or content.get("image") or content.get("images"))
-        raw_url = clean_line(main.get("targetUrl") if isinstance(main, dict) else "")
-        raw_url = raw_url or clean_line(content.get("url") or content.get("targetUrl"))
-        if not raw_url and item_id:
-            raw_url = f"https://www.goofish.com/item?id={item_id}"
-        url = normalize_url(raw_url, "https://www.goofish.com")
+        if item_id:
+            # Always the canonical web URL — never the fleamarket:// deep link or
+            # its per-search tracking params (they break both Telegram links and
+            # the cross-run "already seen" comparison).
+            url = goofish_item_url(item_id)
+        else:
+            raw_url = clean_line(main_target) or clean_line(content.get("url") or content.get("targetUrl"))
+            url = normalize_url(raw_url, "https://www.goofish.com")
         if not title or not price or not url:
             return None
         return Listing(self.source, brand, title, price, url, image_url)
@@ -282,7 +346,9 @@ class GoofishParser:
             and not re.search(r"[¥￥]\s*\d", line)
         ]
         title = title_candidates[0] if title_candidates else ""
-        url = normalize_url(data.get("href") or "", "https://www.goofish.com")
+        href = data.get("href") or ""
+        item_id = goofish_item_id(href)
+        url = goofish_item_url(item_id) if item_id else normalize_url(href, "https://www.goofish.com")
         image_url = first_image(data.get("image"))
         if not title or not price or not url:
             return None
@@ -292,8 +358,11 @@ class GoofishParser:
         seen: set[str] = set()
         result: list[Listing] = []
         for listing in listings:
-            if listing.url in seen:
+            # Same item surfaces under several node shapes with different URL
+            # forms; collapse on the numeric id (falls back to the URL itself).
+            key = goofish_item_id(listing.url) or listing.url
+            if key in seen:
                 continue
-            seen.add(listing.url)
+            seen.add(key)
             result.append(listing)
         return result
