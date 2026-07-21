@@ -77,32 +77,57 @@ class ParserWorker:
             goofish_ctx = self._goofish_or_none() if brands else None
             shopify_ctx = self.shopify if stores else None
 
-            async with contextlib.AsyncExitStack() as stack:
-                if grailed_ctx is not None:
+            # Brand-source browsers run ONE AT A TIME. Two concurrent chromium
+            # instances exhausted the container's memory, so the second launch
+            # (Goofish) failed and — because the failure was only logged, never
+            # recorded — Goofish was silently skipped every cycle while Grailed
+            # looked healthy. Sequential passes keep peak memory to a single
+            # browser, and a start failure is now recorded so it surfaces in
+            # /status instead of vanishing.
+            if grailed_ctx is not None:
+                async with contextlib.AsyncExitStack() as stack:
                     try:
                         await stack.enter_async_context(grailed_ctx)
-                    except Exception:
+                    except Exception as exc:
                         logger.exception("Failed to start Grailed browser; skipping Grailed this cycle.")
+                        self._record_status(
+                            self.grailed.source, "*", ok=False,
+                            error=f"Grailed browser failed to start: {str(exc)[:300]}",
+                        )
                         grailed_ctx = None
-                if goofish_ctx is not None:
+                    if grailed_ctx is not None:
+                        for brand in brands:
+                            await self.run_brand(brand, grailed_ctx, None)
+
+            if goofish_ctx is not None:
+                async with contextlib.AsyncExitStack() as stack:
                     try:
                         await stack.enter_async_context(goofish_ctx)
-                    except Exception:
+                    except Exception as exc:
                         logger.exception("Failed to start Goofish browser; skipping Goofish this cycle.")
+                        self._record_status(
+                            self.goofish.source, "*", ok=False,
+                            error=f"Goofish browser failed to start: {str(exc)[:300]}",
+                        )
                         goofish_ctx = None
-                if shopify_ctx is not None:
+                    if goofish_ctx is not None:
+                        for brand in brands:
+                            await self.run_brand(brand, None, goofish_ctx)
+
+            if shopify_ctx is not None:
+                async with contextlib.AsyncExitStack() as stack:
                     try:
                         await stack.enter_async_context(shopify_ctx)
-                    except Exception:
+                    except Exception as exc:
                         logger.exception("Failed to start Shopify session; skipping stores this cycle.")
+                        self._record_status(
+                            self.shopify.source, "*", ok=False,
+                            error=f"Shopify session failed to start: {str(exc)[:300]}",
+                        )
                         shopify_ctx = None
-
-                for brand in brands:
-                    await self.run_brand(brand, grailed_ctx, goofish_ctx)
-
-                if shopify_ctx is not None:
-                    for store in stores:
-                        await self.run_store(store, shopify_ctx)
+                    if shopify_ctx is not None:
+                        for store in stores:
+                            await self.run_store(store, shopify_ctx)
 
             await self.flush_pending(brands_by_name, stores_by_slug)
 
